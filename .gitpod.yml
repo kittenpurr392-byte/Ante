@@ -1,1 +1,154 @@
+image: gitpod/workspace-full
 
+tasks:
+  - init: |
+      # Install dependencies
+      echo "Installing system dependencies..."
+      sudo apt update
+      sudo apt install -y wget curl git python3 python3-pip unzip
+
+      # Install Arduino CLI
+      echo "Installing Arduino CLI..."
+      curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+      export PATH="$PATH:$HOME/bin"
+      echo "export PATH=\"$PATH:$HOME/bin\"" >> ~/.bashrc
+      source ~/.bashrc
+      if ! command -v arduino-cli &> /dev/null; then
+        echo "Error: arduino-cli not found. Exiting."
+        exit 1
+      fi
+
+      # Configure Arduino CLI
+      echo "Configuring Arduino CLI..."
+      arduino-cli config init
+      arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+      arduino-cli core update-index
+      arduino-cli core install esp32:esp32@1.0.0
+
+      # Define paths
+      ESP32_CORE_DIR="$HOME/.arduino15/packages/esp32/hardware/esp32/1.0.0"
+      ULPTOOL_DIR="$ESP32_CORE_DIR/tools/ulptool"
+      SKETCH_DIR="$HOME/workspace/my_ulp_sketch"
+
+      # Download and set up ulptool
+      echo "Setting up ulptool..."
+      wget -O ulptool.zip https://github.com/duff2013/ulptool/releases/download/2.4.1/ulptool.zip
+      if [ $? -ne 0 ]; then
+        echo "Error: Failed to download ulptool.zip"
+        exit 1
+      fi
+      unzip ulptool.zip
+      mv ulptool-2.4.1 ulptool
+      mkdir -p "$ESP32_CORE_DIR/tools"
+      mv ulptool "$ESP32_CORE_DIR/tools/"
+      if [ -f "$ULPTOOL_DIR/platform.local.txt" ]; then
+        cp "$ULPTOOL_DIR/platform.local.txt" "$ESP32_CORE_DIR/"
+      else
+        echo "Error: platform.local.txt not found in ulptool directory"
+        exit 1
+      fi
+
+      # Download and set up binutils-esp32ulp
+      echo "Setting up binutils-esp32ulp..."
+      wget -O binutils.tar.gz https://github.com/espressif/binutils-esp32ulp/releases/download/v2.28.51-esp-20191205/esp32ulp-elf-binutils-Linux-x86_64-2.28.51-esp-20191205.tar.gz
+      if [ $? -ne 0 ]; then
+        echo "Error: Failed to download binutils-esp32ulp"
+        exit 1
+      fi
+      tar -xzf binutils.tar.gz
+      mkdir -p "$ULPTOOL_DIR/src"
+      mv esp32ulp-elf-binutils* "$ULPTOOL_DIR/src/esp32ulp-elf-binutils"
+
+      # Copy ULP examples to workspace
+      echo "Copying ULP examples..."
+      mkdir -p "$SKETCH_DIR"
+      if [ -d "$ULPTOOL_DIR/src/ulp_examples" ]; then
+        cp -r "$ULPTOOL_DIR/src/ulp_examples" "$SKETCH_DIR/"
+      else
+        echo "Warning: ulp_examples directory not found, skipping copy"
+      fi
+
+      # Create sketch files
+      echo "Creating sketch files..."
+      cat << 'EOF' > "$SKETCH_DIR/ulp_test.ino"
+      #include "esp32/ulp.h"
+      #include "ulp_main.h"
+      #include "ulptool.h"
+
+      extern const uint8_t ulp_main_bin_start[] asm("_binary_ulp_main_bin_start");
+      extern const uint8_t ulp_main_bin_end[] asm("_binary_ulp_main_bin_end");
+
+      static void init_run_ulp(uint32_t usec);
+
+      void setup() {
+          Serial.begin(115200);
+          delay(1000);
+          init_run_ulp(100 * 1000); // 100 msec
+      }
+
+      void loop() {
+          Serial.printf("ulp count: %u\n", ulp_count & 0xFFFF);
+          delay(100);
+      }
+
+      static void init_run_ulp(uint32_t usec) {
+          ulp_count = 0;
+          ulp_set_wakeup_period(0, usec);
+          esp_err_t err = ulptool_load_binary(0, ulp_main_bin_start, (ulp_main_bin_end - ulp_main_bin_start) / sizeof(uint32_t));
+          err = ulp_run((&ulp_entry - RTC_SLOW_MEM) / sizeof(uint32_t));
+      }
+      EOF
+
+      cat << 'EOF' > "$SKETCH_DIR/ulp.s"
+      /* Define variables, which go into .bss section (zero-initialized data) */
+          .bss
+      /* Store count value */
+          .global count
+      count:
+          .long 0
+
+      /* Code goes into .text section */
+          .text
+          .global entry
+      entry:
+          move    r3, count
+          ld      r0, r3, 0
+          add     r0, r0, 1
+          st      r0, r3, 0
+          halt
+      EOF
+
+      cat << 'EOF' > "$SKETCH_DIR/ulp_main.h"
+      /*
+          Put your ULP globals here you want visibility
+          for your sketch. Add "ulp_" to the beginning
+          of the variable name and must be size 'uint32_t'
+      */
+      #include "Arduino.h"
+
+      extern uint32_t ulp_entry;
+      extern uint32_t ulp_count;
+      EOF
+
+      # Compile sketch
+      echo "Compiling sketch..."
+      arduino-cli compile --fqbn esp32:esp32:esp32 "$SKETCH_DIR/ulp_test.ino" --output-dir "$SKETCH_DIR/build"
+      if [ $? -eq 0 ]; then
+        echo "Setup and compilation complete! Binary is in $SKETCH_DIR/build/ulp_test.ino.bin"
+      else
+        echo "Error: Compilation failed. Check logs in $SKETCH_DIR/build/"
+        exit 1
+      fi
+    command: |
+      echo "Workspace ready! Binary is in /workspace/my_ulp_sketch/build/ulp_test.ino.bin"
+      echo "Use Termux to flash the binary (see README.md or instructions)"
+      bash
+
+vscode:
+  extensions:
+    - ms-vscode.cpptools
+    - platformio.platformio-ide
+
+ports:
+  - port: 3232
+    onOpen: ignore
